@@ -1,15 +1,22 @@
 import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
-import { openSync, writeSync, closeSync, readFileSync, statSync } from 'node:fs';
+import { openSync, writeSync, closeSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
 import { ensureAccountIds } from './account-id.js';
+import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  const fromEnv = envVar('CONFIG');
+  if (fromEnv) return fromEnv;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  // The renamed file is used when it exists; until then, and for a fresh
+  // install, the file keeps its current name (issue #72, phase 1). The state
+  // file, crash log and certificates sit beside whichever one this returns.
+  const renamed = join(configDir, `${NAME}.json`);
+  if (existsSync(renamed)) return renamed;
+  return join(configDir, `${LEGACY_NAME}.json`);
 }
 
 /**

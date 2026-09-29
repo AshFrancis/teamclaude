@@ -101,10 +101,12 @@ While the config is being rewritten — by the server rotating a refresh token, 
 
 ## Environment variables
 
+Every `TEAMCLAUDE_*` variable below is also read under the name `TEAMROUTER_*`, which wins when both are set — the project is [being renamed](../README.md#renaming-to-teamrouter), and the old spelling keeps working throughout.
+
 | Variable | Effect |
 | --- | --- |
 | `TC_ACCT` | [Pin a session](routing.md#pin-a-session-to-one-account) to **one** account, bypassing rotation. Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
-| `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
+| `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`, or `~/.config/teamrouter.json` when that file exists) |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
 | `TEAMCLAUDE_STATUS_TIMEOUT_MS` | How long `teamclaude status` waits for the server's answer before giving up (default `5000`). A connection that is accepted but never answered is reported as a stalled or overloaded server, distinct from a refused one ("Is the server running?") |

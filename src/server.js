@@ -28,6 +28,7 @@ import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
+import { envVar, legacyControlUrl } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -68,7 +69,7 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // rate-limit 429 never rotates accounts (that just moves the burst); it pauses
 // the account so concurrent requests wait, then retries the same account.
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
-  Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
+  Number(envVar('RATE_LIMIT_ABSORB_MAX_SECONDS')) || 60;
 // How long to wait before the one retry of a headerless 429 — a 429 carrying no
 // retry-after and no anthropic-ratelimit-* headers at all.
 //
@@ -101,7 +102,7 @@ const DEFAULT_HEADERLESS_429_RETRY_DELAY_MS = 2000;
  * @returns {number}
  */
 function resolveHeaderless429RetryDelayMs() {
-  const raw = process.env.TEAMCLAUDE_HEADERLESS_429_RETRY_DELAY_MS;
+  const raw = envVar('HEADERLESS_429_RETRY_DELAY_MS');
   if (raw == null || raw.trim() === '') return DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
   const env = Number(raw);
   if (env === 0) return 0;
@@ -401,6 +402,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
   const requestHandler = async (req, res) => {
     try {
+      // The control plane answers to its new name as well (issue #72): a URL
+      // under /teamrouter/ is rewritten to /teamclaude/ once, here, so every
+      // route below keeps matching the one spelling it always has. Only the
+      // proxy's own prefix is touched; nothing forwarded upstream starts with it.
+      const legacyUrl = legacyControlUrl(req.url);
+      if (legacyUrl) req.url = legacyUrl;
+
       // Dashboard page — served BEFORE the auth gate on purpose. The page is a
       // static asset containing no data: everything it shows comes from
       // /teamclaude/status, which stays behind the gate and is fetched by the
@@ -822,7 +830,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // classification path like every other prefix test; `/tc-acct/` and an
       // absolute-form proxy URL do not start with it and are untouched.
       const controlPath = classificationPath(req.url);
-      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')) {
+      // Both prefixes: an encoded spelling of the new one (`/%74eamrouter/`)
+      // escapes the rewrite above and must not reach the forwarder either.
+      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')
+        || controlPath === '/teamrouter' || controlPath.startsWith('/teamrouter/')) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
@@ -2561,8 +2572,8 @@ const DEFAULT_STREAM_PEEK_HOLD_MS = 10_000;
  * @returns {{ budgetBytes: number, holdMs: number }}
  */
 export function resolveStreamPeekBounds() {
-  const budget = Number(process.env.TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES);
-  const hold = Number(process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS);
+  const budget = Number(envVar('STREAM_PEEK_BUDGET_BYTES'));
+  const hold = Number(envVar('STREAM_PEEK_HOLD_MS'));
   return {
     budgetBytes: budget > 0 ? budget : DEFAULT_STREAM_PEEK_BUDGET_BYTES,
     holdMs: hold > 0 ? hold : DEFAULT_STREAM_PEEK_HOLD_MS,
@@ -3756,7 +3767,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
 
 function resolveBodyIdleTimeout() {
-  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
+  const env = Number(envVar('UPSTREAM_BODY_TIMEOUT_MS'));
   return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
 }
 
