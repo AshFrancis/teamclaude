@@ -1,12 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
-import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { writeFile, readFile } from 'node:fs/promises';
 import { AccountManager, advisorEligibilityMode } from '../src/account-manager.js';
+import { spawnServer, closedPort } from '../test-helpers/spawn-server.js';
 
 // Issue #479. Claude Code declares the advisor tool on EVERY request, so the
 // advisor's eligibility is paid by all of a client's traffic. With exactly one
@@ -260,58 +256,10 @@ test('setAdvisorEligibility switches a running manager both ways', () => {
 
 // --- Live reload, against the real server ------------------------------------
 
-const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
-
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = /** @type {import('node:net').AddressInfo} */ (probe.address());
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-function startServer(configPath) {
-  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', c => { output += c; });
-  child.stderr.on('data', c => { output += c; });
-  const stop = async () => {
-    child.kill('SIGTERM');
-    const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    // Node does not replay 'exit' to late listeners, so a child that already
-    // died must not hang the await.
-    if (child.exitCode === null && child.signalCode === null) {
-      await new Promise(resolve => child.on('exit', resolve));
-    }
-    clearTimeout(killer);
-  };
-  return { stop, output: () => output };
-}
-
 async function statusOf(port) {
   const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
   assert.equal(res.status, 200);
   return res.json();
-}
-
-async function waitForServer(port, childOutput) {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
-      if (res.ok) return;
-    } catch { /* not up yet */ }
-    if (Date.now() > deadline) throw new Error(`server did not start:\n${childOutput()}`);
-    await new Promise(r => setTimeout(r, 100));
-  }
 }
 
 async function reloadWith(port, configPath, mutate) {
@@ -324,21 +272,19 @@ async function reloadWith(port, configPath, mutate) {
 }
 
 test('reload hot-applies an advisorEligibility edit', async () => {
-  const port = await closedPort();
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-advisor-eligibility-'));
-  const configPath = join(dir, 'config.json');
-  await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: 'tc-test' },
-    // Nothing here sends a request upstream; a closed port makes sure of it.
-    upstream: `http://127.0.0.1:${await closedPort()}`,
-    upstreamProxy: false,
-    advisorEligibility: 'prefer',
-    accounts: [{ name: 'a@example.com', type: 'apikey', apiKey: 'k1' }],
-  }));
-
-  const server = startServer(configPath);
+  // Nothing here sends a request upstream; a closed port makes sure of it.
+  const deadPort = await closedPort();
+  const server = await spawnServer({
+    config: () => ({
+      proxy: { apiKey: 'tc-test' },
+      upstream: `http://127.0.0.1:${deadPort}`,
+      upstreamProxy: false,
+      advisorEligibility: 'prefer',
+      accounts: [{ name: 'a@example.com', type: 'apikey', apiKey: 'k1' }],
+    }),
+  });
+  const { port, configPath } = server;
   try {
-    await waitForServer(port, server.output);
     assert.equal((await statusOf(port)).advisorEligibility, 'prefer', 'read at startup');
 
     await reloadWith(port, configPath, c => { c.advisorEligibility = 'strict'; });
