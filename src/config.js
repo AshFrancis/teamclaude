@@ -202,6 +202,14 @@ const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 25;
 
+/** The wait budget, read per acquisition: TEAMCLAUDE_CONFIG_LOCK_WAIT_MS
+ * overrides the 2 s for a deployment whose writers are known to hold the
+ * lock longer (and lets a test pick a budget its assertions do not race). */
+function lockWaitMs() {
+  const env = Number(envVar('CONFIG_LOCK_WAIT_MS'));
+  return env > 0 ? env : LOCK_WAIT_MS;
+}
+
 function lockIsStale(lockPath) {
   let pid, at;
   try {
@@ -219,7 +227,8 @@ function lockIsStale(lockPath) {
 
 /** True when the lock is ours; false when we gave up and proceed without it. */
 async function acquireConfigLock(lockPath) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       const fd = openSync(lockPath, 'wx', 0o600);
@@ -236,7 +245,7 @@ async function acquireConfigLock(lockPath) {
       continue;
     }
     if (Date.now() >= deadline) {
-      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${LOCK_WAIT_MS}ms; writing the config without it`);
+      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));

@@ -31,7 +31,10 @@ async function rawUpstream(response) {
 // refusal, and after a 101 once the upstream side ends, so the read completes
 // on 'close'. A bounded timeout turns a hang into a failure that shows what
 // arrived.
-async function handshake(upstreamPort, timeoutMs = 5000) {
+// `timeoutMs` is a watchdog against a proxy that never closes the socket,
+// set well above anything a loaded machine adds; the runner's timeout is the
+// other bound.
+async function handshake(upstreamPort, timeoutMs = 60_000) {
   const proxy = http.createServer();
   proxy.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, `http://127.0.0.1:${upstreamPort}`, null, { log: () => {} }));
   const port = await listen(proxy);

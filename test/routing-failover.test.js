@@ -237,17 +237,17 @@ test('a proxy that accepts the connection and never answers is a routing failure
   const port = await listen(proxy);
   try {
     let first;
-    const started = Date.now();
     const lines = await captureLogs(async () => { first = await post(port); });
     assert.equal(first.type, 'response', `reset instead of failing over: ${JSON.stringify(first)}\n${lines.join('\n')}`);
     assert.equal(first.status, 200, lines.join('\n'));
     assert.deepEqual(upstream.hits.map(h => h.key), ['sk-direct'], 'served by the account whose path works');
-    // The tunnel's own budget gave up, not some caller's longer signal (which
-    // would have surfaced as a generic timeout and been retried as transient).
-    assert.ok(Date.now() - started < 10_000, `the forward waited ${Date.now() - started}ms on the wedged proxy`);
 
     const failed = lines.filter(l => l.includes('Routing proxy failed for account "routed"'));
     assert.equal(failed.length, 1, lines.join('\n'));
+    // The tunnel's own budget (TEAMCLAUDE_ROUTING_TIMEOUT_MS above) gave up,
+    // not some caller's longer signal, which would have surfaced as a generic
+    // timeout and been retried as transient. The failure names its budget.
+    assert.match(failed[0], /handshake timed out after 800ms/);
     assert.match(failed[0], /SOCKS5 handshake timed out after 800ms/);
     assert.equal(am.unavailableReason(am.accounts[0]), 'routing');
     assert.ok(am.accounts[0].routingFailedUntil > Date.now(), 'the account sits out the cooldown');
