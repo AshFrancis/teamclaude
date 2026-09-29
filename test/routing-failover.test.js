@@ -27,16 +27,10 @@ const { createProxyServer, isTransientUpstreamError } = await import('../src/ser
 const { routingAgent, parseRoutingUrl, isRoutingFailure, ROUTING_FAILED } = await import('../src/account-routing.js');
 const { renderStatus, UNAVAILABLE_TEXT } = await import('../src/status-renderer.js');
 const { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } = await import('../src/upstream-proxy.js');
+const { closedPort } = await import('../test-helpers/spawn-server.js');
 
 const T = { timeout: 30000 };
 const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
-
-function closedPort() {
-  return new Promise((resolve) => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
-  });
-}
 
 function startUpstream() {
   const hits = [];

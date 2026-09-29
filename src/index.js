@@ -711,6 +711,9 @@ async function serverCommand() {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
+      // Identity, not just liveness: a client (or a test) that finds a server on
+      // the configured port can tell whether it is the one it expects.
+      pid: process.pid,
       upstream: config.upstream || 'https://api.anthropic.com',
       eventLoop: eventLoopMonitor.status(),
     },
