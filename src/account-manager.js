@@ -428,6 +428,34 @@ function sampleModelFor(route) {
   return route.match[0].replace(/\*/g, '') || 'model';
 }
 
+/**
+ * Normalize the `advisorEligibility` setting to a mode.
+ *
+ *   'strict' / absent → the account must be eligible for the advisor's model as
+ *                       well as the request's (#98). The default.
+ *   'prefer'          → the advisor's model stops being a filter when honouring
+ *                       it would leave part of the fleet unused (see
+ *                       _advisorForSelection).
+ * Anything else is 'strict'. Unlike distributeSessions there is no generous
+ * reading of a typo here: 'prefer' lets an account that is not routed for the
+ * advisor's family serve it, so it is only ever entered by name. Said once,
+ * naming the value, so the operator is not left believing it took.
+ */
+const warnedAdvisorValues = new Set();
+
+/** @param {unknown} setting  @returns {'strict'|'prefer'} */
+export function advisorEligibilityMode(setting) {
+  if (setting == null) return 'strict';
+  const value = typeof setting === 'string' ? setting.trim().toLowerCase() : null;
+  if (value === 'strict' || value === 'prefer') return value;
+  const shown = safeLine(JSON.stringify(setting) ?? String(setting), 64);
+  if (!warnedAdvisorValues.has(shown)) {
+    warnedAdvisorValues.add(shown);
+    console.warn(`[TeamClaude] advisorEligibility: unrecognised value ${shown}, using "strict" (valid: "strict", "prefer")`);
+  }
+  return 'strict';
+}
+
 export class AccountManager {
   /**
    * @param {Array<Object>} accounts  config entries, credentials resolved
@@ -445,9 +473,10 @@ export class AccountManager {
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
+   * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -508,6 +537,16 @@ export class AccountManager {
     // as a spent family bucket does not (#276).
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
+    // 'strict' | 'prefer': whether an advisor request's second model filters
+    // the fleet or merely describes it (see _advisorForSelection).
+    this.setAdvisorEligibility(advisorEligibility);
+    // The last advisor request whose advisor model left part of the fleet out,
+    // for the status readout: { model, eligible, of, at }. Null once an advisor
+    // request finds the two sets equal again. The log line is throttled and
+    // scrolls away; this is what an operator reading status later still sees.
+    /** @type {{ model: string, eligible: number, of: number, at: number }|null} */
+    this._advisorNarrowing = null;
+    this._advisorNarrowLogAt = 0;
     this.setRoutes(routes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
@@ -953,7 +992,10 @@ export class AccountManager {
    * sub-inference runs on the SAME account and spends that model's family
    * bucket, so the account must be eligible for both models. When no account
    * satisfies both, selection degrades to executor-only routing so the main
-   * request keeps flowing (upstream then fails just the advisor call).
+   * request keeps flowing (upstream then fails just the advisor call). When
+   * only SOME do, the request is confined to them, which is said in the log,
+   * or under `advisorEligibility: "prefer"` it is routed on its own model
+   * instead (see _advisorForSelection).
    *
    * `sessionId` is a PIN KEY throughout this class and the session tracker: a
    * client session narrowed to the conversation within it, since one client
@@ -980,6 +1022,10 @@ export class AccountManager {
 
     let account;
     let walked;
+    // The advisor model selection was held to: the request's own, or null
+    // where 'prefer' set it aside (see _advisorForSelection).
+    /** @type {*} */
+    let routedAdvisor = null;
     // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
     // whole walk is synchronous, so nothing can interleave and observe it, and
     // the alternative is a provider argument on six private methods that exist
@@ -992,7 +1038,16 @@ export class AccountManager {
     // upstream round trip, by which time another request has selected.
     this._selectionDecision = decision;
     try {
-      account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
+      const excluded = this._excludeOtherProviders(exclude, provider);
+      // Settled once, here, rather than in the walks: session distribution and
+      // the untagged spread select on the advisor model as well, so a check
+      // inside _select alone would miss exactly the configurations that spread.
+      // Read where the cursor is recorded below too, so it is keyed by what
+      // was routed on. Announced by a first attempt only: a retry's exclusions
+      // shrink both sets, so its counts describe that request and not the fleet.
+      const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
+      routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
+      account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
@@ -1007,7 +1062,7 @@ export class AccountManager {
     // rotation code, so recording there alone would leave the cursor unset and
     // the next real failover unpaced.
     if (account) {
-      this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
+      this.routeCursors.set(this._cursorKey(model, routedAdvisor, provider), account.index);
       // `walked` names where this walk left the shared slot, captured in the
       // `finally` while it still held it. When it names one of this provider's
       // own accounts — including a borrow that re-seeded and then held its
@@ -1220,7 +1275,15 @@ export class AccountManager {
     // fleet-wide gate is what keeps a hop off a HEALTHY account (a per-minute
     // 429 pause leaves it available) from spending quota to skip a wait — see
     // _pickFallback.
-    const normal = this._pickBestAvailable(excluded, model, advisorModel);
+    // The same reading of the advisor model as the selection this hop detours
+    // from, or 'prefer' would spread the first attempt and pin every hop. A hop
+    // has no executor-only pass of its own to fall to, so under 'prefer' the
+    // advisor is set aside here when nothing left can serve it as well.
+    // Unannounced: a hop's exclusions shrink both sets, so its counts describe
+    // this one request and not the fleet.
+    const reach = advisorModel && this.advisorEligibility === 'prefer'
+      ? this._advisorReach(excluded, model, advisorModel) : null;
+    const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
     if (normal) return normal;
     const pick = this._pickFallback(excluded, model, provider);
     if (!pick) return null;
@@ -1263,6 +1326,83 @@ export class AccountManager {
     const combined = new Set(exclude || []);
     for (const account of foreign) combined.add(account.index);
     return combined;
+  }
+
+  /**
+   * The advisor model selection should hold accounts to: `advisorModel` itself,
+   * or null where 'prefer' sets it aside.
+   *
+   * Claude Code declares the advisor tool on EVERY request, invoked or not, so
+   * the advisor's eligibility is paid by all of a client's traffic. Where only
+   * some of the accounts that can serve the request can also serve the
+   * advisor, that confines the whole fleet's traffic to them and leaves the
+   * rest idle, and nothing used to say so: the one diagnostic fired at zero
+   * eligible accounts, not at one (#479).
+   *
+   * 'strict' keeps the filter (#98: an account that cannot run the advisor
+   * fails the advisor call, and Claude Code then drops the advisor for the
+   * session) and announces the narrowing. 'prefer' routes such a request as
+   * though it declared no advisor: every account that can serve the request's
+   * own model is a candidate, under the ordinary rotation, and whichever serves
+   * it runs the advisor call too. The advisor model is kept wherever it costs
+   * nothing, which is when every candidate can serve it.
+   *
+   * No eligible account at all is neither case. It stays with the degrade in
+   * _pickActiveAccount, which has always routed it on the request model.
+   *
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {boolean} [note]  announce and record what was found
+   * @returns {string|null}
+   */
+  _advisorForSelection(exclude, model, advisorModel, note = false) {
+    if (!advisorModel) return null;
+    const { eligible, of } = this._advisorReach(exclude, model, advisorModel);
+    const narrows = eligible > 0 && eligible < of;
+    const prefer = this.advisorEligibility === 'prefer';
+    if (note) {
+      // Left as it was when nothing is eligible: that is the degrade's case,
+      // and it says nothing about whether the fleet is narrowed otherwise.
+      if (narrows) this._advisorNarrowing = { model: safeLine(advisorModel, 64), eligible, of, at: Date.now() };
+      else if (eligible > 0) this._advisorNarrowing = null;
+    }
+    // Throttled like the degrade line in _pickActiveAccount, and for the same
+    // reason: this is true of every request a Claude Code session sends.
+    if (note && narrows && Date.now() >= this._advisorNarrowLogAt) {
+      this._advisorNarrowLogAt = Date.now() + 60_000;
+      // The model name comes out of the client's request body (see safe-text.js).
+      const name = safeLine(advisorModel, 64);
+      console.log(prefer
+        ? `[TeamClaude] Advisor model "${name}" is served by ${eligible} of ${of} accounts — advisorEligibility is "prefer", routing by request model only`
+        : `[TeamClaude] Advisor model "${name}" narrows selection to ${eligible} of ${of} accounts — set advisorEligibility to "prefer" to route by request model instead`);
+    }
+    return narrows && prefer ? null : advisorModel;
+  }
+
+  /** How many accounts outside `exclude` can serve `model` right now (`of`),
+   *  and how many of those can serve `advisorModel` as well (`eligible`). Two
+   *  availability checks per account, on a path that already makes several.
+   *  @param {Set<number>|null} exclude
+   *  @param {*} model  loosely typed, like the availability checks it feeds
+   *  @param {*} advisorModel
+   *  @returns {{ eligible: number, of: number }} */
+  _advisorReach(exclude, model, advisorModel) {
+    let eligible = 0;
+    let of = 0;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isAvailable(account, model, null)) continue;
+      of++;
+      if (this._isAvailable(account, model, advisorModel)) eligible++;
+    }
+    return { eligible, of };
+  }
+
+  /** Apply the `advisorEligibility` setting; safe on every config reload.
+   *  @param {unknown} setting */
+  setAdvisorEligibility(setting) {
+    this.advisorEligibility = advisorEligibilityMode(setting);
   }
 
   _pickActiveAccount(exclude, model, advisorModel, sessionId) {
@@ -4680,6 +4820,11 @@ export class AccountManager {
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
+      // The mode, and the last advisor request it mattered to: how many of the
+      // accounts that could serve the request could also serve its advisor.
+      // Null when the last advisor request found no difference between them.
+      advisorEligibility: this.advisorEligibility,
+      advisorNarrowing: this._advisorNarrowing ? { ...this._advisorNarrowing } : null,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
       // Empty outside adaptive mode, so the renderer needs no mode check of its

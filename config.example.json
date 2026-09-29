@@ -16,6 +16,7 @@
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "distributeSessions": false,
+  "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
   "autoRedeemResets": false,
