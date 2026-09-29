@@ -384,15 +384,18 @@ test('a write that never settles is answered, and the queue moves on without it'
 });
 
 test('the write queue takes only so many turns; past that a call is refused at once', async () => {
+  // Each write's reload hands out its release and announces that it was
+  // reached; waitFor(n) is that announcement, not a poll against a deadline
+  // (the runner's own timeout bounds a write that never arrives).
   const releases = [];
-  const reload = () => new Promise(resolve => { releases.push(resolve); });
+  const arrivals = [];
+  const reload = () => new Promise(resolve => {
+    releases.push(resolve);
+    for (const arrival of arrivals.splice(0)) arrival();
+  });
   const { tools, disk } = await fixture({ hooks: { reload }, options: { writeQueueDepth: 2 } });
   const waitFor = async (n) => {
-    const deadline = Date.now() + 5000;
-    while (releases.length < n) {
-      if (Date.now() > deadline) throw new Error(`write ${n} never reached its reload`);
-      await new Promise(r => setTimeout(r, 5));
-    }
+    while (releases.length < n) await new Promise(resolve => arrivals.push(resolve));
   };
   const first = tools.call('set_probe_interval', { seconds: 120 });
   const second = tools.call('set_probe_interval', { seconds: 130 });

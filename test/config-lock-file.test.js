@@ -14,11 +14,18 @@ import { join } from 'node:path';
 // of {pid, at}, staleness by age or dead pid, a bounded wait, and that the lock
 // is advisory — a writer that cannot get it still writes.
 
-async function withConfigDir(fn) {
+// `lockWaitMs` is the wait budget for the run, when a test's assertions depend
+// on it: a test that must observe a release before the budget runs out gets a
+// budget no scheduler stall can exhaust; a test of the budget itself gets a
+// short one, so it is fast and its lower bound is the only timing it asserts.
+async function withConfigDir(fn, { lockWaitMs = null } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'tc-lock-'));
   const prev = process.env.TEAMCLAUDE_CONFIG;
+  const prevWait = process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS;
   const path = join(dir, 'teamclaude.json');
   process.env.TEAMCLAUDE_CONFIG = path;
+  if (lockWaitMs != null) process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS = String(lockWaitMs);
+  else delete process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS;
   try {
     const cfg = await import('../src/config.js');
     await writeFile(path, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts: [] }));
@@ -26,7 +33,22 @@ async function withConfigDir(fn) {
   } finally {
     if (prev === undefined) delete process.env.TEAMCLAUDE_CONFIG;
     else process.env.TEAMCLAUDE_CONFIG = prev;
+    if (prevWait === undefined) delete process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS;
+    else process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS = prevWait;
   }
+}
+
+// The bypass warning is the one observable difference between a write that
+// waited for the holder and one that gave up on it.
+function captureBypassWarnings() {
+  const warnings = [];
+  const origError = console.error;
+  console.error = (...args) => {
+    const line = args.join(' ');
+    if (/is still held by another process/.test(line)) warnings.push(line);
+    else origError(...args);
+  };
+  return { warnings, restore: () => { console.error = origError; } };
 }
 
 const readJson = async (path) => JSON.parse(await readFile(path, 'utf-8'));
@@ -74,31 +96,43 @@ test('a fresh lock whose pid is dead is broken', async () => {
 });
 
 test('a live lock held by another process delays the write until it is released', async () => {
+  // A budget no stall of this process can run out: the write below must be
+  // seen to wait for the release, never to give up on it.
   await withConfigDir(async ({ dir, cfg, path, lockPath }) => {
-    // The other writer: takes the lock exactly as we do, holds it 500 ms, releases.
+    // The other writer: takes the lock exactly as we do, holds it until told
+    // to let go (a byte on stdin), and releases. Event-driven rather than
+    // timed, so what the test observes is ordering, not the scheduler.
     const holder = spawn(process.execPath, ['-e', `
       const fs = require('node:fs');
       const fd = fs.openSync(process.argv[1], 'wx', 0o600);
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
       fs.closeSync(fd);
       process.stdout.write('locked\\n');
-      setTimeout(() => fs.unlinkSync(process.argv[1]), 500);
-    `, lockPath], { stdio: ['ignore', 'pipe', 'inherit'] });
+      process.stdin.once('data', () => { fs.unlinkSync(process.argv[1]); process.exit(0); });
+    `, lockPath], { stdio: ['pipe', 'pipe', 'inherit'] });
     const exited = new Promise(resolve => holder.on('exit', resolve));
     await new Promise((resolve, reject) => {
       holder.stdout.once('data', resolve);
       holder.once('error', reject);
     });
 
-    const started = Date.now();
-    await cfg.saveConfig({ fresh: true });
-    const waited = Date.now() - started;
-    assert.ok(waited >= 400, `the write waited for the holder (waited ${waited}ms)`);
-    assert.ok(waited < 1500, `the write went through as soon as the lock was released, not at the 2 s cap (waited ${waited}ms)`);
+    const { warnings, restore } = captureBypassWarnings();
+    try {
+      const write = cfg.saveConfig({ fresh: true });
+      // While the holder has the lock, the write has not happened: the file
+      // still carries what withConfigDir put there.
+      await new Promise(r => setTimeout(r, 100));
+      assert.deepEqual(await readJson(path), { proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts: [] }, 'the write waited for the holder');
+      holder.stdin.write('go\n');
+      await write;
+    } finally {
+      restore();
+    }
+    assert.deepEqual(warnings, [], 'the write went through on the release, not by giving up on the lock');
     assert.deepEqual(await readJson(path), { fresh: true });
     assert.equal(await exited, 0, 'the holder unlinked its own lock; nobody removed it from under it');
     assert.deepEqual(await readdir(dir), ['teamclaude.json']);
-  });
+  }, { lockWaitMs: 600_000 });
 });
 
 test('the lock is released after a success and after a throwing mutator', async () => {
@@ -118,25 +152,26 @@ test('the lock is released after a success and after a throwing mutator', async 
   });
 });
 
-test('a lock that stays held past the 2 s budget is bypassed with one warning, and left in place', async () => {
+test('a lock that stays held past the wait budget is bypassed with one warning, and left in place', async () => {
+  // A short budget: what is asserted is that the writer waited at least that
+  // long and then gave up with one warning. How much later it actually ran is
+  // the scheduler's, not the code's, so no upper bound.
   await withConfigDir(async ({ cfg, path, lockPath }) => {
     // Fresh, and the pid is alive (ours): nothing lets a writer break it.
     const body = { pid: process.pid, at: Date.now() };
     await writeFile(lockPath, JSON.stringify(body));
-    const warnings = [];
-    const origError = console.error;
-    console.error = (...args) => warnings.push(args.join(' '));
+    const { warnings, restore } = captureBypassWarnings();
     try {
       const started = Date.now();
       await cfg.saveConfig({ fresh: true });
       const waited = Date.now() - started;
-      assert.ok(waited >= 1900 && waited < 4000, `gave up at the budget, not before and not much after (waited ${waited}ms)`);
+      assert.ok(waited >= 200, `gave up no sooner than the budget (waited ${waited}ms)`);
     } finally {
-      console.error = origError;
+      restore();
     }
     assert.deepEqual(await readJson(path), { fresh: true }, 'the write still landed');
     assert.equal(warnings.length, 1, warnings.join('\n'));
-    assert.match(warnings[0], /teamclaude\.json\.lock is still held/);
+    assert.match(warnings[0], /teamclaude\.json\.lock is still held by another process after 200ms/);
     assert.deepEqual(await readJson(lockPath), body, 'the other holder\'s lock was not touched');
-  });
+  }, { lockWaitMs: 200 });
 });

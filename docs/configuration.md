@@ -10,7 +10,7 @@ That file is small for a typical fleet, but it is no longer trivially small: usa
 
 At the 500-value cap that means a file of a few MiB when every value is genuinely active at once (the file is pretty-printed, so that is bytes on disk), and on the order of a hundred KiB when the values churn — one busy day each — or when only the lifetime rows remain. The write is synchronous: serialising the all-active case costs tens of milliseconds before the `fsync`, once a minute. A fleet with a handful of client keys is unaffected either way, but a deployment pointing a high-cardinality dimension at this on slow storage should know the shape of it.
 
-While the config is being rewritten — by the server rotating a refresh token, by a CLI command that saves, or by any other client — the writer holds `teamclaude.json.lock` next to it: a file containing `{"pid":<pid>,"at":<ms epoch>}`. It is an advisory lock so that separate writers wait for one another instead of overwriting each other's edit (a lost write here was typically a freshly rotated refresh token, which cost a re-login). It exists for milliseconds; a lock older than 10 s or whose pid is gone is treated as stale and removed by the next writer, and a writer that cannot get it within 2 s proceeds anyway, with one warning in the log, rather than hang. It is safe to delete by hand if one is left behind.
+While the config is being rewritten — by the server rotating a refresh token, by a CLI command that saves, or by any other client — the writer holds `teamclaude.json.lock` next to it: a file containing `{"pid":<pid>,"at":<ms epoch>}`. It is an advisory lock so that separate writers wait for one another instead of overwriting each other's edit (a lost write here was typically a freshly rotated refresh token, which cost a re-login). It exists for milliseconds; a lock older than 10 s or whose pid is gone is treated as stale and removed by the next writer, and a writer that cannot get it within 2 s (`TEAMCLAUDE_CONFIG_LOCK_WAIT_MS`) proceeds anyway, with one warning in the log, rather than hang. It is safe to delete by hand if one is left behind.
 
 ## Format
 
@@ -109,6 +109,7 @@ Every `TEAMCLAUDE_*` variable below is also read under the name `TEAMROUTER_*`, 
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`, or `~/.config/teamrouter.json` when that file exists) |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
+| `TEAMCLAUDE_CONFIG_LOCK_WAIT_MS` | How long a writer waits for another process's `<config>.lock` before writing without it (default `2000`). See [Where it lives](#where-it-lives) |
 | `TEAMCLAUDE_STATUS_TIMEOUT_MS` | How long `teamclaude status` waits for the server's answer before giving up (default `5000`). A connection that is accepted but never answered is reported as a stalled or overloaded server, distinct from a refused one ("Is the server running?") |
 | `HTTPS_PROXY` / `ALL_PROXY` | Outbound proxy used when the config sets no `upstreamProxy` (lowercase forms honoured too) |
 | `NO_PROXY` | Hosts that bypass the outbound proxy, when the config sets no `noProxy`. Also inherited by clients that `teamclaude run`/`env` launch — their loopback entries are added to yours, and `*` is ignored |
