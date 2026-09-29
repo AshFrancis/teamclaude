@@ -3100,6 +3100,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
 
+    // And a response that is not an error is proof its API key works: the 401
+    // cooldown and the count behind its length start over (#473). Only that —
+    // a 429 or a 5xx says nothing about the key either way.
+    if (upstreamRes.status < 400) accountManager.clearCredentialRejected(account.index);
+
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
@@ -3475,8 +3480,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // hours while three healthy siblings served none of them (#412). Like the
     // 403 above, the client must not see it: Claude Code reads a 401 as its own
     // login having died. So the account is skipped for this request and the
-    // request fails over. It also leaves rotation when nothing here can ever
-    // repair it: an API key, or an OAuth account with no refresh token to try.
+    // request fails over. It also leaves rotation when nothing here can
+    // repair it: an OAuth account with no refresh token to try, for good, and an
+    // API key for a cooldown that lengthens while it keeps being rejected — a
+    // gateway answers 401 with a good key when its own upstream is down (#473;
+    // see markCredentialRejected).
     // An account that DOES hold one only fails over. Its second 401 can be stale
     // news — the forced refresh is suppressed for a short floor after a
     // successful one (the refresh-storm guard), so the retry may have gone out
@@ -4197,7 +4205,8 @@ export function rewriteModel(body, modelMap) {
 function blockingResets(accountManager, account, model) {
   const q = account.quota || {};
   /** @type {any[]} */
-  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil];
+  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil,
+    account.credentialRejectedUntil];
 
   if (q.unified5h != null && q.unified5h >= accountManager.thresholdFor('unified5h')) {
     resets.push(q.unified5hReset);

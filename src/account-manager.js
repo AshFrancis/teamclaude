@@ -72,6 +72,16 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 // proxies do come back, and the first request after the cooldown is the probe:
 // it either serves or re-arms this.
 const ROUTING_FAILURE_COOLDOWN_SECONDS = 30;
+// How long an API-key account sits out after upstream answers 401, indexed by
+// how many 401s it has answered in a row. A 401 on an API key is weaker
+// evidence than it looks: a gateway (LiteLLM and the like) answers one while
+// its OWN upstream is unreachable, with a key that is perfectly good (#473).
+// So the first hold is short, and each further rejection with no success in
+// between lengthens it. The last entry is the ceiling and is never left for a
+// permanent `error`: a key that really is revoked then costs one failed-over
+// request an hour, which is cheap, while a fallback account silently dead for
+// good is not.
+export const CREDENTIAL_REJECTED_COOLDOWNS_SECONDS = [60, 5 * 60, 15 * 60, 60 * 60];
 
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
@@ -401,6 +411,12 @@ function makeAccount(acct, index, listener = null) {
     // The account's own routing proxy could not be reached (see
     // markRoutingFailed). Ephemeral for the same reason: a live observation.
     routingFailedUntil: /** @type {number|null} */ (null),
+    // Upstream answered 401 to this account's API key (see
+    // markCredentialRejected). Ephemeral like the two above. The count is of
+    // consecutive rejections and sets the length of the next hold; a response
+    // that is not an error resets it.
+    credentialRejectedUntil: /** @type {number|null} */ (null),
+    credentialRejections: 0,
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -938,6 +954,31 @@ export class AccountManager {
   clearRoutingFailed(index) {
     const account = this.accounts[index];
     if (account?.routingFailedUntil) account.routingFailedUntil = null;
+  }
+
+  /** True while an API-key account sits out a 401 (see markCredentialRejected).
+   * Expiry is consumed lazily, as the other cooldowns' is. The count of
+   * rejections is NOT cleared here: only a served request proves the key, and
+   * the request that follows the hold is the one that finds out.
+   * @param {Record<string, any>|undefined} account
+   * @param {number} [now] */
+  _credentialHeld(account, now = Date.now()) {
+    if (!account?.credentialRejectedUntil) return false;
+    if (now < account.credentialRejectedUntil) return true;
+    account.credentialRejectedUntil = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" 401 cooldown expired; the next request retries its API key`);
+    return false;
+  }
+
+  /** A response that was not an error is proof the key works: lift the hold
+   * and forget the rejections that led to it, so the next 401 starts again
+   * from the shortest cooldown.
+   * @param {number} index */
+  clearCredentialRejected(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.credentialRejectedUntil = null;
+    account.credentialRejections = 0;
   }
 
   /** True while an account is in its routing-failure cooldown; expiry is
@@ -2012,6 +2053,10 @@ export class AccountManager {
     // Nor a routing cooldown: probing would spend the connect budget on a
     // proxy that was unreachable seconds ago, and the hold is short anyway.
     if (this._routingDown(account)) return false;
+    // Nor a 401 cooldown. The probe path runs when every account is
+    // unavailable, which is exactly when a held API key would otherwise be
+    // asked again on every request — the loop the hold exists to prevent.
+    if (this._credentialHeld(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -2313,7 +2358,7 @@ export class AccountManager {
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'credential', 'advisor-capped', 'advisor-quota', 'advisor-route'.
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -2341,6 +2386,9 @@ export class AccountManager {
 
     // The account's own routing proxy could not be reached a moment ago.
     if (this._routingDown(account)) return 'routing';
+
+    // Upstream answered 401 to this account's API key a moment ago.
+    if (this._credentialHeld(account)) return 'credential';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -3839,6 +3887,9 @@ export class AccountManager {
       // here would send a live request on an account that must not be used and,
       // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
       if (account.disabled || account.status === 'error') continue;
+      // Nor one sitting out a 401: an old quota window that has since rolled
+      // would otherwise name it the soonest to reset and send it the request.
+      if (this._credentialHeld(account)) continue;
       // A routed/owned model must not fall back to an ineligible account —
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
@@ -4174,6 +4225,8 @@ export class AccountManager {
       account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
+    // The same explicit "try this again" for an API key sitting out a 401.
+    if (!disabled) this.clearCredentialRejected(accountIndex);
   }
 
   /**
@@ -4507,9 +4560,25 @@ export class AccountManager {
 
   /**
    * Take an account out of rotation because upstream rejected its credential
-   * and nothing in this process can repair it. `error` is the state selection
+   * and nothing in this process can repair it.
+   *
+   * For an OAuth account that is for good: `error` is the state selection
    * already skips and status already explains ("needs re-login"); a reload that
    * brings a new credential, or re-enabling the account, clears it.
+   *
+   * For an API key it is a cooldown. `error` had no way back for one — the
+   * revalidation probe skips `error` and nothing else re-checks a key — so a
+   * single 401 from a gateway whose own upstream was down benched a working
+   * account until someone toggled it by hand, 22 hours in the report (#473).
+   * The account is held instead, for longer each time it is rejected again
+   * with no success in between (CREDENTIAL_REJECTED_COOLDOWNS_SECONDS), and the
+   * first request after the hold is the retry. While held it is unavailable to
+   * selection and to the probe alike, so the 401 loop `error` was introduced to
+   * stop (#412) stays stopped: a revoked key is asked once per cooldown.
+   *
+   * Its own field rather than the 429 hold (`throttled`/rateLimitedUntil):
+   * that one is lifted by any non-429 response and opened to the probe after a
+   * minute, and a 401 is a non-429 response.
    *
    * @param {number} accountIndex
    * @param {string} why  one clause for the log line
@@ -4517,6 +4586,19 @@ export class AccountManager {
   markCredentialRejected(accountIndex, why) {
     const account = this.accounts[accountIndex];
     if (!account || account.status === 'error') return;
+    if (account.type !== 'oauth') {
+      // Requests already in flight when the first 401 landed come back with
+      // their own. They are the same news, not further rejections, and counting
+      // them would run one bad minute straight up to the longest cooldown.
+      if (account.credentialRejectedUntil && Date.now() < account.credentialRejectedUntil) return;
+      const steps = CREDENTIAL_REJECTED_COOLDOWNS_SECONDS;
+      const seconds = steps[Math.min(account.credentialRejections || 0, steps.length - 1)];
+      account.credentialRejections = (account.credentialRejections || 0) + 1;
+      account.credentialRejectedUntil = Date.now() + seconds * 1000;
+      const nth = account.credentialRejections > 1 ? `, ${account.credentialRejections} in a row` : '';
+      console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" held out of rotation for ${seconds}s: ${why}${nth} — it will be retried after that; if it keeps failing, check the key in the config`);
+      return;
+    }
     account.status = 'error';
     const remedy = account.type === 'oauth' ? 'run: teamclaude login' : 'check the key in the config';
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — ${remedy}`);
@@ -4783,6 +4865,9 @@ export class AccountManager {
           : null,
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
+          : null,
+        credentialRejectedUntil: a.credentialRejectedUntil && a.credentialRejectedUntil > Date.now()
+          ? new Date(a.credentialRejectedUntil).toISOString()
           : null,
       })),
     };
