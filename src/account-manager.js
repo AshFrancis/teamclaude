@@ -116,6 +116,7 @@ export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
+  'unified5hSeenAt', 'unified7dSeenAt',
   'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
@@ -178,6 +179,12 @@ function emptyQuota() {
     unified7dReset: null,       // ms timestamp
     unified7dSonnetReset: null, // ms timestamp
     unified7dFableReset: null,  // ms timestamp
+    // When upstream last stated each shared window (ms timestamp), moved only
+    // with that window's own value. Nothing here gates on them: they are for
+    // status readers, which otherwise cannot tell a reading taken a minute ago
+    // from one restored off disk after a week idle. Null means unknown age.
+    unified5hSeenAt: /** @type {number|null} */ (null),
+    unified7dSeenAt: /** @type {number|null} */ (null),
     // When each family bucket was last confirmed by upstream (ms timestamp).
     // Only these two buckets need it: they are the ones a spent reading can seal
     // itself into, since selection stops sending the family that would refresh them.
@@ -307,6 +314,7 @@ function makeAccount(acct, index, listener = null) {
     // that id. The Anthropic counterpart is `accountUuid`, which is patched
     // into the request body instead.
     accountId: acct.accountId || null,
+    userId: acct.userId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -1476,14 +1484,25 @@ export class AccountManager {
    * prompt cache it built there. An untagged request picks where it goes and
    * changes nothing for anyone else.
    *
+   * The cursor turns within the top priority tier only, the filter
+   * `_pickAdaptive` keeps for the same reason: banding may span priorities (it
+   * passes everything through when expiry routing is off, and appends the lower
+   * tiers back when it is on). Without it a last-resort account took its turn
+   * like any other — a priority-200 inference gateway answered Claude Code's
+   * bootstrap and connector calls with 404 while every account above it had
+   * quota (#472). A lower tier sees untagged traffic once nothing above it is
+   * available.
+   *
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string|null} advisorModel
    * @returns {Record<string, any>|null}
    */
   _selectUntagged(exclude, model, advisorModel) {
-    const candidates = this._bandedCandidates(exclude, model, advisorModel);
-    if (candidates.length === 0) return null;
+    const banded = this._bandedCandidates(exclude, model, advisorModel);
+    if (banded.length === 0) return null;
+    const topPriority = Math.min(...banded.map(a => a.priority || 0));
+    const candidates = banded.filter(a => (a.priority || 0) === topPriority);
     const cursor = this._untaggedCursor;
     this._untaggedCursor = cursor + 1;
     return candidates[cursor % candidates.length];
@@ -3463,6 +3482,7 @@ export class AccountManager {
       account.sessionResetPending = true;
       q.unified5h = null;
       q.unified5hReset = null;
+      q.unified5hSeenAt = null;
       // `rejected` describes the shared buckets and this is one of them: a
       // 5-hour rejection must not outlive the 5-hour window it was about.
       q.unifiedStatus = null;
@@ -3474,6 +3494,7 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
+      q.unified7dSeenAt = null;
       q.unifiedStatus = null;
       q.unifiedStatusSeenAt = null;
       changed = true;
@@ -3929,9 +3950,13 @@ export class AccountManager {
       limits[key] = safeLine(active, 64);
     }
 
-    if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
+    if (parsed.unified5h != null) {
+      account.quota.unified5h = parsed.unified5h;
+      account.quota.unified5hSeenAt = Date.now();
+    }
     if (parsed.unified7d != null) {
       account.quota.unified7d = parsed.unified7d;
+      account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
@@ -4010,9 +4035,13 @@ export class AccountManager {
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
-    if (!isNaN(u5h)) account.quota.unified5h = u5h;
+    if (!isNaN(u5h)) {
+      account.quota.unified5h = u5h;
+      account.quota.unified5hSeenAt = Date.now();
+    }
     if (!isNaN(u7d)) {
       account.quota.unified7d = u7d;
+      account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
 
@@ -4212,14 +4241,19 @@ export class AccountManager {
     if (!account || !usage || usage.error) return;
     const q = account.quota;
     const observed = new Set();
+    const now = Date.now();
 
     if (usage.fiveHour) {
-      if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
+      if (usage.fiveHour.utilization != null) {
+        q.unified5h = usage.fiveHour.utilization;
+        q.unified5hSeenAt = now;
+      }
       if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
     }
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) {
         q.unified7d = usage.sevenDay.utilization;
+        q.unified7dSeenAt = now;
         observed.add('unified7d');
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
@@ -4243,7 +4277,6 @@ export class AccountManager {
     // The reported reset is taken verbatim, null included: an unstarted window
     // has no reset, and keeping a stale one (copied from the shared weekly
     // bucket by the header path) both misdates the bar and misranks the account.
-    const now = Date.now();
     for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
       const bucket = usage[usageKey];
       const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key, account);
@@ -4312,10 +4345,12 @@ export class AccountManager {
     if (usage.fiveHour) {
       q.unified5h = usage.fiveHour.utilization;
       q.unified5hReset = usage.fiveHour.resetAt ?? null;
+      q.unified5hSeenAt = Date.now();
     }
     if (usage.sevenDay) {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
+      q.unified7dSeenAt = Date.now();
     }
     // Same sticky fact the header path records; see _updateCodexQuota.
     if (usage.fiveHour) q.sessionWindowStated = true;
@@ -4685,7 +4720,7 @@ export class AccountManager {
       // `accountUuid`: a row saved without them reads as Anthropic and stops
       // matching the account it was written for. Rows from an older version
       // therefore stop restoring Codex quota, which is re-learned from traffic.
-      return { accountUuid: a.accountUuid, accountId: a.accountId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
     });
   }
 
