@@ -50,6 +50,7 @@ import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './
 import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
+import { envVar } from './brand.js';
 import {
   ConfigOpError,
   DISTRIBUTE_MODES,
@@ -381,7 +382,7 @@ async function serverCommand() {
   // account tokens and — via CONNECT — can relay arbitrarily). Opt into a wider
   // bind explicitly with TEAMCLAUDE_HOST or config.proxy.host (e.g. '0.0.0.0'),
   // in which case set proxy.apiKey so the auth gate protects remote clients.
-  const bindHost = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const bindHost = envVar('HOST') || config.proxy.host || '127.0.0.1';
   const headless = args.includes('--headless') || args.includes('--no-tui');
   const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
 
@@ -1480,7 +1481,7 @@ async function statusCommand() {
   // A connection that is accepted and then never answered is a different
   // failure from a refused one — a stalled or overloaded server rather than a
   // stopped one — and without a deadline this command would just hang on it.
-  const configuredTimeout = Number(process.env.TEAMCLAUDE_STATUS_TIMEOUT_MS);
+  const configuredTimeout = Number(envVar('STATUS_TIMEOUT_MS'));
   const timeoutMs = configuredTimeout > 0 ? configuredTimeout : 5_000;
 
   try {
@@ -1521,7 +1522,7 @@ async function attachCommand() {
   // the config or the environment is not reachable as localhost, and reporting
   // "not running" for a server that is plainly up is the worst of the answers.
   // A wildcard bind is not an address to dial, so dial this machine instead.
-  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const bound = envVar('HOST') || config.proxy.host || '127.0.0.1';
   const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
 
   // Checked before connecting: the dashboard needs raw-mode input, and failing
@@ -1558,7 +1559,7 @@ async function attachCommand() {
 async function dashboardCommand() {
   const config = await loadOrCreateConfig();
   const port = config.proxy.port;
-  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const bound = envVar('HOST') || config.proxy.host || '127.0.0.1';
   const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
   const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
   if (!(await isProxyUp(port))) {
@@ -1895,7 +1896,7 @@ async function serviceCommand() {
   // systemd does not inherit the shell's TEAMCLAUDE_CONFIG, so a non-default
   // config would silently be ignored and the service would serve a different
   // (or empty) account list than the CLI does.
-  const configPath = process.env.TEAMCLAUDE_CONFIG || null;
+  const configPath = envVar('CONFIG') || null;
 
   switch (sub) {
     case 'install': {
@@ -2489,6 +2490,9 @@ Environment:
   TEAMCLAUDE_CONFIG   Path to the config file (default below)
   TEAMCLAUDE_DISABLE_AUTOUPDATE=1
                       Skip the background self-update check
+  Every TEAMCLAUDE_* variable is also read as TEAMROUTER_*, which wins when
+  both are set: the project is being renamed to TeamRouter, and 'teamrouter'
+  already runs this same CLI. See github.com/KarpelesLab/teamclaude/issues/72.
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.
@@ -2546,7 +2550,7 @@ A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
 
-Config: ${getConfigPath()}
+Config: ${getConfigPath()} (a ~/.config/teamrouter.json is used when it exists)
 Crash log: ${getCrashLogPath()} (server; written when the process dies unexpectedly)
 `);
 }
@@ -2776,7 +2780,7 @@ function applyOrExit(change) {
 // Returns an idempotent stop() that restores the shell's previous title.
 function startTerminalTitleUpdater(accountManager) {
   const out = process.stdout;
-  if (!out.isTTY || process.env.TEAMCLAUDE_NO_TITLE) return () => {};
+  if (!out.isTTY || envVar('NO_TITLE')) return () => {};
 
   let last = null;
   const render = () => {
