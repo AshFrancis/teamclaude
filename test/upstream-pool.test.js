@@ -18,24 +18,30 @@ async function listen(handler) {
 // HTTP/2 connection does under concurrent uploads.
 test('concurrent requests each open their own connection and run in parallel', async () => {
   let conns = 0;
-  const HEADER_DELAY = 300;
+  const N = 8;
+  // A barrier, not a delay: no request is answered until all N have arrived.
+  // Requests that serialize behind one connection can never all arrive, so
+  // the barrier never opens and the watchdog fails the test; requests that
+  // run in parallel all arrive, however slowly the machine gets them there.
+  /** @type {import('node:http').ServerResponse[]} */
+  const pending = [];
+  let serialized = false;
+  const answerAll = () => { for (const res of pending.splice(0)) { res.writeHead(200); res.end('ok'); } };
+  const watchdog = setTimeout(() => { serialized = true; answerAll(); }, 30_000);
   const { server, port } = await listen((req, res) => {
-    setTimeout(() => { res.writeHead(200); res.end('ok'); }, HEADER_DELAY);
+    pending.push(res);
+    if (pending.length === N) { clearTimeout(watchdog); answerAll(); }
   });
   server.on('connection', () => { conns += 1; });
 
-  const N = 8;
-  const started = Date.now();
   const bodies = await Promise.all(
     Array.from({ length: N }, () =>
-      upstreamFetch(`http://127.0.0.1:${port}/`, { headersTimeoutMs: 5000 }).then((r) => r.text())),
+      upstreamFetch(`http://127.0.0.1:${port}/`, { headersTimeoutMs: 60_000 }).then((r) => r.text())),
   );
-  const elapsed = Date.now() - started;
 
   assert.deepEqual(bodies, Array(N).fill('ok'));
   assert.equal(conns, N, `expected ${N} parallel connections, saw ${conns}`);
-  // Parallel: total ≈ one request's delay, NOT N × delay (serialization).
-  assert.ok(elapsed < HEADER_DELAY * 3, `expected parallel (~${HEADER_DELAY}ms), took ${elapsed}ms`);
+  assert.equal(serialized, false, `the ${N} requests did not all arrive while the first was still pending`);
 
   server.close();
 });

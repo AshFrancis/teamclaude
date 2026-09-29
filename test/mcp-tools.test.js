@@ -347,20 +347,23 @@ test('a tool that blows up reports a generic failure, never the exception', asyn
 test('write tools run one at a time, so a removal cannot race a reload', async () => {
   const order = [];
   let releaseReload;
-  const reload = () => new Promise(resolve => { order.push('reload:start'); releaseReload = () => { order.push('reload:end'); resolve(0); }; });
+  // The reload announces that it was reached, so the test waits for that —
+  // not for a duration, and not against a deadline of its own: the runner's
+  // timeout bounds a write that never arrives.
+  let reachedReload;
+  const reached = new Promise(resolve => { reachedReload = resolve; });
+  const reload = () => new Promise(resolve => {
+    order.push('reload:start');
+    releaseReload = () => { order.push('reload:end'); resolve(0); };
+    reachedReload();
+  });
   const persistAccounts = async () => { order.push('persist'); };
   const { tools } = await fixture({ hooks: { reload, persistAccounts } });
 
   const first = tools.call('set_threshold', { percent: 70 });
   const second = tools.call('remove_account', { account: 'alice@example.com' });
   try {
-    // Wait for the first call to reach its reload — not for a duration — before
-    // judging what the second has done meanwhile.
-    const deadline = Date.now() + 5000;
-    while (!releaseReload) {
-      if (Date.now() > deadline) throw new Error('the first write never reached its reload');
-      await new Promise(r => setTimeout(r, 5));
-    }
+    await reached;
     assert.deepEqual(order, ['reload:start'], 'the removal must wait for the running write to finish');
   } finally {
     // Released whatever the verdict: the queue is shared by every write tool

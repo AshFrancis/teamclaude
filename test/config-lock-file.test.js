@@ -76,9 +76,9 @@ test('two concurrent atomicConfigUpdate calls both land', async () => {
 test('a lock older than 10 s is broken even though its pid is alive', async () => {
   await withConfigDir(async ({ dir, cfg, path, lockPath }) => {
     await writeFile(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() - 60_000 }));
-    const started = Date.now();
-    await cfg.saveConfig({ fresh: true });
-    assert.ok(Date.now() - started < 1000, 'a stale lock does not cost the 2 s wait');
+    const { warnings, restore } = captureBypassWarnings();
+    try { await cfg.saveConfig({ fresh: true }); } finally { restore(); }
+    assert.deepEqual(warnings, [], 'a stale lock is broken, not waited out and bypassed');
     assert.deepEqual(await readJson(path), { fresh: true });
     assert.deepEqual(await readdir(dir), ['teamclaude.json'], 'the stale lock is gone');
   });
@@ -87,9 +87,9 @@ test('a lock older than 10 s is broken even though its pid is alive', async () =
 test('a fresh lock whose pid is dead is broken', async () => {
   await withConfigDir(async ({ dir, cfg, path, lockPath }) => {
     await writeFile(lockPath, JSON.stringify({ pid: await deadPid(), at: Date.now() }));
-    const started = Date.now();
-    await cfg.saveConfig({ fresh: true });
-    assert.ok(Date.now() - started < 1000, 'a dead holder does not cost the 2 s wait');
+    const { warnings, restore } = captureBypassWarnings();
+    try { await cfg.saveConfig({ fresh: true }); } finally { restore(); }
+    assert.deepEqual(warnings, [], 'a dead holder\'s lock is broken, not waited out and bypassed');
     assert.deepEqual(await readJson(path), { fresh: true });
     assert.deepEqual(await readdir(dir), ['teamclaude.json']);
   });
@@ -145,9 +145,9 @@ test('the lock is released after a success and after a throwing mutator', async 
     assert.equal((await readJson(path)).ok, true, 'the failed update wrote nothing');
 
     // And the next writer is not held up by anything the failure left behind.
-    const started = Date.now();
-    await cfg.saveConfig({ after: true });
-    assert.ok(Date.now() - started < 1000);
+    const { warnings, restore } = captureBypassWarnings();
+    try { await cfg.saveConfig({ after: true }); } finally { restore(); }
+    assert.deepEqual(warnings, [], 'nothing left behind was waited out');
     assert.deepEqual(await readJson(path), { after: true });
   });
 });
